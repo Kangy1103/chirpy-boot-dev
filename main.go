@@ -1,96 +1,64 @@
 package main
 
 import (
-	"encoding/json"
+	"database/sql"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
+	"os"
 	"sync/atomic"
-)
 
-func main() {
-	testServer()
-}
+	"github.com/Kangy1103/chirpy-boot-dev/internal/database"
+	"github.com/joho/godotenv"
+
+	_ "github.com/lib/pq"
+)
 
 type apiConfig struct {
 	fileserverHits atomic.Int32
+	dbQueries      *database.Queries
+	platform       string
 }
 
-func (cfg *apiConfig) MiddlewareMetricsInc(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		log.Println("Received a request!")
-		cfg.fileserverHits.Add(1)
-		next.ServeHTTP(w, req)
-	})
-}
-
-func (cfg *apiConfig) Metrics(w http.ResponseWriter, req *http.Request) {
-	hits := cfg.fileserverHits.Load()
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	body := fmt.Sprintf(
-		`<html>
-			<body>
-				<h1>Welcome, Chirpy Admin</h1>
-				<p>Chirpy has been visited %d times!</p>
-			</body>
-		</html>`,
-		hits)
-	io.WriteString(w, body)
-}
-
-func (cfg *apiConfig) ResetMetrics(w http.ResponseWriter, req *http.Request) {
-	cfg.fileserverHits.Store(0)
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	fmt.Println("Metrics reset!")
-}
-
-type chirps struct {
-	Body string `json:"body"`
-}
-
-func JSONDecoder(w http.ResponseWriter, req *http.Request) {
-	type isValid struct {
-		Valid bool `json:"valid"`
-	}
-	decoder := json.NewDecoder(req.Body)
-	chirp := chirps{}
-	err := decoder.Decode(&chirp)
+func main() {
+	err := godotenv.Load()
 	if err != nil {
-		log.Printf("Could not decode chirp: %s", err)
-		ErrorResponse(w, 500, "Something went wrong")
-		return
+		log.Fatalf(".env file not found: %s", err)
 	}
+	dbURL := os.Getenv("DB_URL")
+	platform := os.Getenv("PLATFORM")
 
-	if len(chirp.Body) > 140 {
-		ErrorResponse(w, 400, "Chirp is too long")
-		return
-	} else {
-		isValid := isValid{
-			Valid: true,
-		}
-		JSONResponse(w, 200, isValid)
-		return
-	}
-}
-
-func JSONResponse(w http.ResponseWriter, code int, bodyJSON interface{}) {
-	data, err := json.Marshal(bodyJSON)
+	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
-		log.Printf("Error marshalling JSON: %s", err)
-		w.WriteHeader(500)
-		return
+		log.Fatalf("cannot load database: %s", err)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	w.Write(data)
-}
+	dbQueries := database.New(db)
+	cfg := &apiConfig{
+		dbQueries: dbQueries,
+		platform:  platform,
+	}
 
-func ErrorResponse(w http.ResponseWriter, code int, msg string) {
-	type errorBody struct {
-		Error string `json:"error"`
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /api/healthz", isServerReady)
+
+	mux.HandleFunc("POST /api/users", cfg.CreateUsers)
+	mux.HandleFunc("POST /api/chirps", cfg.ChirpDecoder)
+	mux.HandleFunc("POST /api/login", cfg.UserLogin)
+	mux.HandleFunc("POST /admin/reset", cfg.ResetMetrics)
+
+	mux.HandleFunc("GET /admin/metrics", cfg.Metrics)
+	mux.HandleFunc("GET /api/chirps", cfg.GetChirps)
+	mux.HandleFunc("GET /api/chirps/{chirpID}", cfg.GetChirp)
+
+	fmt.Println("Server started...")
+	fs := http.StripPrefix("/app/", http.FileServer(http.Dir(".")))
+	mux.Handle("/app/", cfg.MiddlewareMetricsInc(fs))
+
+	s := &http.Server{
+		Addr:    ":8080",
+		Handler: mux,
 	}
-	JSONResponse(w, code, errorBody{Error: msg})
+	fmt.Println("File server started...")
+	log.Fatal(s.ListenAndServe())
 }
